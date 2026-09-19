@@ -24,6 +24,7 @@ function arg(name) {
 
 const probe = process.argv.includes("--probe");
 const token = arg("token") ?? "";
+const weeklyResume = arg("weeklyResume") === "1";
 const anchorId = arg("anchor") ?? process.env.OPENCLAW_ANCHOR_ID ?? "";
 const agentId = arg("agent") ?? process.env.OPENCLAW_AGENT_ID ?? "main";
 const timezone = arg("timezone") ?? process.env.OPENCLAW_TIMEZONE ?? "Europe/Helsinki";
@@ -62,19 +63,22 @@ function openclaw(args, timeout = 240_000) {
   }
 }
 
-function readWindow() {
+function readWindows() {
   const status = JSON.parse(
     openclaw(["status", "--usage", "--agent", agentId, "--json"], 60_000),
   );
   const provider = status.usage?.providers?.find((item) => item.provider === "openai");
-  const window = provider?.windows?.find((item) => item.label === "5h");
-  const resetAt = Number(window?.resetAt);
-  const usedPercent = Number(window?.usedPercent);
-
-  if (!Number.isFinite(resetAt) || !Number.isFinite(usedPercent)) {
-    throw new Error("OpenAI 5h window data is missing; refusing to anchor");
+  function parseWindow(label) {
+    const window = provider?.windows?.find((item) => item.label === label);
+    const resetAt = window?.resetAt;
+    const usedPercent = window?.usedPercent;
+    if (!Number.isFinite(resetAt) || resetAt <= 0
+      || !Number.isFinite(usedPercent) || usedPercent < 0 || usedPercent > 100) {
+      throw new Error(`OpenAI ${label} window data is missing or invalid; refusing to anchor`);
+    }
+    return { resetAt, usedPercent };
   }
-  return { resetAt, usedPercent };
+  return { fiveHour: parseWindow("5h"), week: parseWindow("Week") };
 }
 
 function localHour(ms) {
@@ -122,8 +126,8 @@ function saveState(state) {
   renameSync(temporaryFile, stateFile);
 }
 
-function scheduleCheck(atMs, reason) {
-  if (!mayAnchorAt(atMs)) {
+function scheduleCheck(atMs, reason, { weeklyResume: resume = false } = {}) {
+  if (!resume && !mayAnchorAt(atMs)) {
     saveState({ expectedToken: null, nextCheckAt: atMs, reason: `quiet-hours: ${reason}` });
     log("quiet-hours", {
       nextDailyCheck: `${String(quietEndHour).padStart(2, "0")}:00`,
@@ -144,6 +148,7 @@ function scheduleCheck(atMs, reason) {
     `timezone=${timezone}`,
     `quietEndHour=${quietEndHour}`,
     `token=${nextToken}`,
+    ...(resume ? ["weeklyResume=1"] : []),
   ];
   const result = JSON.parse(
     openclaw([
@@ -166,6 +171,7 @@ function scheduleCheck(atMs, reason) {
     nextCheckAt: atMs,
     scheduledJobId: result.id,
     reason,
+    weeklyResume: resume,
   });
   log("scheduled", { jobId: result.id, checkAt: localTime(atMs), reason });
 }
@@ -196,24 +202,41 @@ function main() {
     return;
   }
 
-  const window = readWindow();
-  const readyAt = window.resetAt + GRACE;
-  const floatingWindow = isFloatingWindow(window, now);
+  const { fiveHour, week } = readWindows();
+  const readyAt = fiveHour.resetAt + GRACE;
+  const floatingWindow = isFloatingWindow(fiveHour, now);
+  const weekExhausted = week.usedPercent >= 100;
+  const weeklyCheckAt = Math.max(week.resetAt + GRACE, now + GRACE);
 
   if (probe) {
     log("probe", {
-      usedPercent: window.usedPercent,
-      resetAt: localTime(window.resetAt),
-      action: floatingWindow
-        ? "anchor now (unused/floating window)"
-        : readyAt > now
-          ? `check at ${localTime(readyAt)}`
-          : "anchor now (expired window)",
+      usedPercent: fiveHour.usedPercent,
+      resetAt: localTime(fiveHour.resetAt),
+      weeklyUsedPercent: week.usedPercent,
+      weeklyResetAt: localTime(week.resetAt),
+      action: weekExhausted
+        ? `check weekly quota at ${localTime(weeklyCheckAt)}`
+        : !mayAnchorAt(now) && !weeklyResume
+          ? "quiet hours; wait for daily check"
+          : floatingWindow
+            ? "anchor now (unused/floating window)"
+            : readyAt > now
+              ? `check at ${localTime(readyAt)}`
+              : "anchor now (expired window)",
     });
     return;
   }
 
-  if (!mayAnchorAt(now)) {
+  if (weekExhausted) {
+    log("weekly-exhausted", {
+      weeklyResetAt: localTime(week.resetAt),
+      nextCheck: localTime(weeklyCheckAt),
+    });
+    scheduleCheck(weeklyCheckAt, "weekly reset plus 5 minutes", { weeklyResume: true });
+    return;
+  }
+
+  if (!weeklyResume && !mayAnchorAt(now)) {
     log("quiet-hours", {
       nextDailyCheck: `${String(quietEndHour).padStart(2, "0")}:00`,
     });
@@ -221,18 +244,18 @@ function main() {
   }
 
   if (!floatingWindow && readyAt > now) {
-    scheduleCheck(readyAt, "current window plus 5 minutes");
+    scheduleCheck(readyAt, "current window plus 5 minutes", { weeklyResume });
     return;
   }
 
   if (floatingWindow) {
     log("unused-floating-window", {
-      reportedResetAt: localTime(window.resetAt),
+      reportedResetAt: localTime(fiveHour.resetAt),
       action: "anchor now",
     });
   }
 
-  log("anchor-start", { previousResetAt: localTime(window.resetAt) });
+  log("anchor-start", { previousResetAt: localTime(fiveHour.resetAt) });
   const result = JSON.parse(
     openclaw([
       "automations",
@@ -252,10 +275,15 @@ function main() {
   const completedAt = Date.now();
   let nextAt = completedAt + FIVE_HOURS + GRACE;
   let reason = "anchor completion plus 5h05m (fallback)";
+  let nextWeeklyResume = false;
   try {
-    const after = readWindow();
-    if (after.resetAt > completedAt) {
-      nextAt = after.resetAt + GRACE;
+    const after = readWindows();
+    if (after.week.usedPercent >= 100) {
+      nextAt = Math.max(after.week.resetAt + GRACE, completedAt + GRACE);
+      reason = "weekly reset plus 5 minutes";
+      nextWeeklyResume = true;
+    } else if (after.fiveHour.resetAt > completedAt) {
+      nextAt = after.fiveHour.resetAt + GRACE;
       reason = "new resetAt plus 5 minutes";
     }
   } catch (error) {
@@ -266,7 +294,7 @@ function main() {
     tokens: result.run?.usage?.total_tokens ?? null,
     nextCheck: localTime(nextAt),
   });
-  scheduleCheck(nextAt, reason);
+  scheduleCheck(nextAt, reason, { weeklyResume: nextWeeklyResume });
 }
 
 try {
