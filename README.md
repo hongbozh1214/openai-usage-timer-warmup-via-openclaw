@@ -1,7 +1,7 @@
-# OpenClaw OpenAI 5-Hour Window Alignment and Weekly Quota Warmup
+# OpenAI Usage Timer Warmup via OpenClaw
 
-Align OpenAI's rolling 5-hour usage window and warm up the weekly quota after its reset in OpenClaw.  
-在 OpenClaw 中对齐 OpenAI 的 5 小时额度窗口，并在周额度刷新后进行小请求暖启动。
+Align the 5-hour usage timer and make a small model request after the weekly quota resets.  
+通过 OpenClaw 暖启动 OpenAI 用量计时：对齐 5 小时窗口，并在周额度刷新后发起一次小请求。
 
 > [中文说明](#中文) · [English](#english)
 
