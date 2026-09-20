@@ -1,7 +1,7 @@
-# OpenClaw OpenAI Window Alignment
+# OpenClaw OpenAI 5-Hour Window Alignment and Weekly Quota Warmup
 
-Adaptive alignment for OpenAI's rolling 5-hour usage window in OpenClaw.  
-用于 OpenClaw 的 OpenAI 5 小时滚动额度窗口自适应对齐方案。
+Align OpenAI's rolling 5-hour usage window and warm up the weekly quota after its reset in OpenClaw.  
+在 OpenClaw 中对齐 OpenAI 的 5 小时额度窗口，并在周额度刷新后进行小请求暖启动。
 
 > [中文说明](#中文) · [English](#english)
 
